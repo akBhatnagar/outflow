@@ -1,0 +1,49 @@
+{
+  "$schema": "https://turborepo.org/schema.json",
+  "globalDependencies": [".env", ".env.example", "tsconfig.base.json"],
+  "globalEnv": ["NODE_ENV", "CI"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**",
+        "prisma/**",
+        "public/**",
+        "package.json",
+        "tsconfig*.json",
+        "next.config.*",
+        "nest-cli.json"
+      ],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "outputs": []
+    },
+    "lint:fix": {
+      "cache": false,
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": ["src/**", "test/**", "package.json", "tsconfig*.json"],
+      "outputs": ["coverage/**"]
+    },
+    "test:e2e": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "outputs": ["playwright-report/**"]
+    },
+    "clean": {
+      "cache": false,
+      "outputs": []
+    }
+  }
+}

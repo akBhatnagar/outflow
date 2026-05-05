@@ -1,0 +1,22 @@
+// Outflow database schema (Prisma).
+// Phase 0: bootstrap with a single _AppMeta row so `prisma generate` works.
+// Phase 1 will replace this with User, RefreshToken, AuditLog, BillingAccount.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Single-row metadata table. Will be repurposed or removed in Phase 1.
+model AppMeta {
+  id        String   @id @default(cuid())
+  schemaVersion String  @default("0.0.0")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("_app_meta")
+}
