@@ -1,6 +1,10 @@
-// Outflow database schema (Prisma).
-// Phase 0: bootstrap with a single _AppMeta row so `prisma generate` works.
-// Phase 1 will replace this with User, RefreshToken, AuditLog, BillingAccount.
+// Outflow database schema
+//
+// Conventions:
+// - All PKs are UUIDs (cuid for MVP; will switch to UUIDv7 post-launch).
+// - All money is stored as integer cents + ISO 4217 currency code.
+// - Soft deletes use `deletedAt`; partial indexes filter on `WHERE deleted_at IS NULL`.
+// - Sensitive fields (`passwordHash`, OAuth tokens) NEVER appear in API responses.
 
 generator client {
   provider = "prisma-client-js"
@@ -11,12 +15,181 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-/// Single-row metadata table. Will be repurposed or removed in Phase 1.
-model AppMeta {
-  id        String   @id @default(cuid())
-  schemaVersion String  @default("0.0.0")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// ---- Auth & Identity ----
 
-  @@map("_app_meta")
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique @db.Citext
+  passwordHash    String
+  name            String?
+  emailVerifiedAt DateTime?
+  tz              String    @default("UTC")
+  currencyPref    String    @default("USD")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  refreshTokens  RefreshToken[]
+  auditLogs      AuditLog[]
+  billingAccount BillingAccount?
+  subscriptions  Subscription[]
+  charges        Charge[]
+
+  @@map("users")
+}
+
+/// Refresh tokens use rotation: every refresh issues a new token and revokes the
+/// previous one. If a revoked token is presented, we revoke the entire `familyId`
+/// (every token derived from the same login) — that's how we detect theft.
+model RefreshToken {
+  id         String    @id @default(cuid())
+  userId     String
+  tokenHash  String    @unique
+  familyId   String
+  userAgent  String?
+  ip         String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+/// Append-only audit log for sensitive mutations. We will partition by month later.
+model AuditLog {
+  id           String   @id @default(cuid())
+  userId       String?
+  action       String
+  resourceType String
+  resourceId   String?
+  ip           String?
+  userAgent    String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([resourceType, resourceId])
+  @@map("audit_logs")
+}
+
+/// One billing account per user. Stripe specifics here, but the field set is
+/// kept minimal until Phase 6 wires up real Stripe webhooks.
+model BillingAccount {
+  id               String    @id @default(cuid())
+  userId           String    @unique
+  stripeCustomerId String?   @unique
+  stripeSubId      String?   @unique
+  plan             Plan      @default(FREE)
+  status           String?
+  currentPeriodEnd DateTime?
+  cancelAt         DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("billing_accounts")
+}
+
+enum Plan {
+  FREE
+  PRO
+  FAMILY
+}
+
+// ---- Subscriptions domain ----
+
+/// Categories are seeded globally (Streaming, Productivity, Cloud, …) and can later
+/// be user-extended. For now `userId IS NULL` rows are global.
+model Category {
+  id      String  @id @default(cuid())
+  slug    String  @unique
+  name    String
+  icon    String?
+  color   String?
+  sortKey Int     @default(0)
+
+  subscriptions Subscription[]
+
+  @@map("categories")
+}
+
+model Subscription {
+  id             String             @id @default(cuid())
+  userId         String
+  categoryId     String?
+  vendorSlug     String? // links to a future Vendor table once Phase 3 ships
+  displayName    String
+  currency       String             @default("USD")
+  amountCents    Int
+  cadence        Cadence            @default(MONTHLY)
+  customDays     Int? // for Cadence = CUSTOM_DAYS
+  nextChargeDate DateTime?
+  trialEndsAt    DateTime?
+  status         SubscriptionStatus @default(ACTIVE)
+  source         SubscriptionSource @default(MANUAL)
+  confidence     Decimal?           @db.Decimal(3, 2)
+  notes          String?
+  firstSeenAt    DateTime           @default(now())
+  lastSeenAt     DateTime           @default(now())
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  deletedAt      DateTime?
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  charges  Charge[]
+
+  @@index([userId, status, nextChargeDate])
+  @@index([userId, deletedAt])
+  @@map("subscriptions")
+}
+
+enum Cadence {
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+  CUSTOM_DAYS
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  TRIAL
+}
+
+enum SubscriptionSource {
+  MANUAL
+  CSV
+  EMAIL_PARSER
+  EMAIL_LLM
+}
+
+/// Individual charges feed price-hike detection (Phase 4) and historical charts.
+model Charge {
+  id             String   @id @default(cuid())
+  userId         String
+  subscriptionId String
+  amountCents    Int
+  currency       String
+  chargedAt      DateTime
+  source         String   @default("manual") // manual | email | csv
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId, chargedAt])
+  @@index([userId, chargedAt])
+  @@map("charges")
 }

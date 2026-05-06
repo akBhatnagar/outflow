@@ -10,7 +10,7 @@
 
 Outflow scans your inbox for subscription receipts, identifies recurring charges with vendor-specific parsers (with regex and LLM fallbacks), and **alerts you 3 days before each trial ends**. It catches duplicate services and silent price hikes — without ever asking for your bank credentials.
 
-This README will grow with each phase. Right now we're at **Phase 0** (project setup).
+This README will grow with each phase. Right now we're at **Phase 1** — auth + a working manual subscription tracker. Sign up, log in, add subscriptions, see your monthly burn on the dashboard. Gmail auto-detection lands in Phase 2.
 
 ## Table of contents
 
@@ -79,31 +79,65 @@ This project is also a learning resource. **Every tool below has a one-paragraph
 
 ## Local development
 
+First boot (one-time setup):
+
 ```bash
-# Node + pnpm
-nvm use                                            # Node 22+
+# 1. Node 22+ via nvm if you have it, plus pnpm via corepack
+nvm use                                            # picks up .nvmrc
 corepack enable && corepack prepare pnpm@9.15.0 --activate
 
-# Install
+# 2. Install workspace dependencies
 pnpm install
 
-# Boot Postgres, Redis, Mailhog, MinIO
+# 3. Boot Postgres, Redis, Mailhog, MinIO
 cp .env.example .env
 docker compose -f docker-compose.dev.yml up -d
 
-# Run apps
+# 4. Apply DB migrations + seed categories
+pnpm --filter @outflow/api exec prisma migrate deploy
+pnpm --filter @outflow/api exec prisma db seed
+
+# 5. Run dev servers
 pnpm dev
-# → API:  http://localhost:4000   (docs: /docs)
+# → API:  http://localhost:4000   (docs at /docs in non-production)
 # → Web:  http://localhost:3000
+```
+
+After that, every-day workflow is:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d   # if not already running
+pnpm dev
 ```
 
 Useful single-app commands:
 
 ```bash
-pnpm --filter @outflow/api dev
-pnpm --filter @outflow/web dev
-pnpm --filter @outflow/api exec prisma studio
+pnpm --filter @outflow/api dev          # API only, with watch mode
+pnpm --filter @outflow/web dev          # web only
+pnpm --filter @outflow/api exec prisma studio   # GUI for the DB
+pnpm --filter @outflow/api test                  # API unit tests
+pnpm typecheck && pnpm lint && pnpm test         # everything
 ```
+
+## What works today (Phase 1)
+
+| Flow              | URL              | Behaviour                                                                                   |
+| ----------------- | ---------------- | ------------------------------------------------------------------------------------------- |
+| Marketing landing | `/`              | Anonymous: sign-up CTA. Logged-in: redirects to `/dashboard`.                               |
+| Sign up           | `/signup`        | Creates user, hashes password with Argon2id, sets httpOnly cookies, redirects to dashboard. |
+| Log in            | `/login`         | Session cookie + rotating refresh token.                                                    |
+| Dashboard         | `/dashboard`     | Live monthly spend, annualised total, top categories, upcoming charges.                     |
+| Subscriptions     | `/subscriptions` | Add / edit / pause / cancel / delete (soft).                                                |
+| Settings          | `/settings`      | Profile read-only, log-out button.                                                          |
+
+API endpoints (Swagger UI at `http://localhost:4000/docs`):
+
+- `POST /api/v1/auth/signup` · `POST /api/v1/auth/login` · `POST /api/v1/auth/refresh` · `POST /api/v1/auth/logout` · `GET /api/v1/auth/me`
+- `GET /api/v1/subscriptions` · `POST /api/v1/subscriptions` · `GET/PATCH/DELETE /api/v1/subscriptions/:id` · `PATCH /api/v1/subscriptions/:id/status`
+- `GET /api/v1/categories`
+- `GET /api/v1/insights/summary`
+- `GET /health/{live,ready,version}`
 
 ## Project structure
 

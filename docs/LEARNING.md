@@ -532,3 +532,91 @@ By the time Outflow ships, you'll have hands-on experience with:
 - **As a study guide** — pick a section, read it, then go find that file/usage in the codebase. Tracing a concept from "abstract" to "this exact line" is how senior knowledge sticks.
 - **As an interview prep checklist** — every concept above is a possible interview question. Try explaining each one out loud.
 - **As a portfolio narrative** — when a recruiter asks "what's the most interesting thing in this project?", pick three from this list and tell the story.
+
+---
+
+## Phase 1 additions (auth + manual subscription tracker)
+
+These concepts joined the codebase in the Phase 1 commit.
+
+### Cookie-based session auth (vs localStorage tokens)
+
+**What's in the code.** `apps/api/src/modules/auth/auth.controller.ts` sets two `httpOnly` cookies on signup/login: `outflow_at` (15-minute access JWT) and `outflow_rt` (30-day opaque refresh token). The browser sends them automatically on every fetch with `credentials: 'include'` (`apps/web/src/lib/client/api.ts`).
+
+**Why httpOnly cookies, not localStorage.** Tokens in `localStorage` are readable by any JS that runs on the page. One leaked dependency, one XSS, and your token's gone. `httpOnly` cookies are inaccessible to JS — even on a successful XSS, the attacker can't exfiltrate the token.
+
+**Trade-off.** CSRF becomes a real concern. Mitigations live alongside: `SameSite=Lax` (defaults to lax in modern browsers), CORS with explicit `credentials: true` and an origin allowlist, and — when we ship a real domain in Phase 7 — `SameSite=Strict` for the refresh cookie.
+
+### Refresh-token rotation with reuse detection
+
+**The pattern.** Every `POST /auth/refresh` does three things atomically:
+
+1. Look up the presented refresh token by SHA-256 hash.
+2. If it's already revoked → revoke the **whole family** (every token derived from the same login) and return 401. That's the signal of a stolen-token replay.
+3. Otherwise issue a new access + refresh pair in the same family and revoke the old refresh.
+
+**Where in code.** `apps/api/src/modules/auth/auth.service.ts → refresh()`. The fake-prisma test in `auth.service.spec.ts` exercises the family-burn path explicitly.
+
+**Why it matters.** Without rotation, a stolen refresh token grants infinite sessions. With rotation but without reuse detection, you can't tell legitimate from theft. With both, theft becomes a one-time event you can audit.
+
+### Argon2id password hashing
+
+**Why not bcrypt.** Bcrypt resists CPU brute-force but not GPU. Argon2id is the OWASP-recommended default — a memory-hard function that defeats GPU/ASIC parallelism. Each guess costs the attacker proportionally more memory.
+
+**Constant-time login.** When a user doesn't exist, we still hash the supplied password against a dummy invalid argon2 string before returning 401. This makes "user exists" vs "user doesn't exist" indistinguishable from request timings — closing a small but real account-enumeration oracle.
+
+### Global guard via APP_GUARD
+
+**Default-deny security model.** `app.module.ts` registers `JwtAuthGuard` as `APP_GUARD` — every controller method requires auth unless tagged `@Public()`. New controllers added later inherit this protection automatically. You won't accidentally ship an unauthenticated endpoint.
+
+### RFC 7807 problem+json errors
+
+**The shape.** `apps/api/src/common/filters/all-exceptions.filter.ts` returns errors as `{ type, title, status, detail, errors, instance }`, content-type `application/problem+json`. This is the IETF standard for HTTP error bodies — clients can parse a single shape across every API.
+
+**Bonus.** The filter maps Prisma's `P2002` (unique violation) to HTTP 409 and `P2025` (record not found) to 404 — so you don't end up with raw 500s for ordinary collisions.
+
+### Prisma soft deletes + composite indexes
+
+**Convention.** `subscriptions` (and other user-data tables) use `deletedAt` rather than physical delete. Index `(userId, deletedAt)` plus `WHERE deletedAt IS NULL` keeps queries fast. Composite index `(userId, status, nextChargeDate)` powers the dashboard's "active subs sorted by next charge" query in one B-tree seek.
+
+### Money as integer cents + ISO currency
+
+**Never store money as floats.** `0.1 + 0.2 !== 0.3` in IEEE-754. We store `amountCents` as `INTEGER` plus a 3-letter ISO 4217 currency code. Display logic converts to user-locale strings via `Intl.NumberFormat`.
+
+### Cadence amortisation
+
+**See** `apps/api/src/modules/insights/insights.service.ts → monthlyAmountCents()`. Yearly subs are divided by 12, weekly by `12/52`, custom days by `(365/12) / customDays`. The unit test in `insights.service.spec.ts` is a good place to start when you want to extend with new cadences.
+
+### Server Components reading httpOnly cookies
+
+**The pattern.** `apps/web/src/lib/server/api.ts` is marked `import 'server-only'`. It reads cookies via `next/headers → cookies()` and forwards them to the API. Pages that fetch protected data (`/dashboard`, `/subscriptions`) are Server Components, so they run only on the server with full cookie access — there's no need to ship the user's session to the client.
+
+**Why this is huge.** Initial page render comes back fully populated (no loading flicker, no second-fetch waterfall). Client components handle mutations and live updates via TanStack Query.
+
+### TanStack Query as the boundary between server and client state
+
+**The split.**
+
+- **Server data** (subscriptions, categories, insights) → React Query. Initial data comes from the SSR fetch, then the client refetches/invalidates on mutation.
+- **UI state** (dialog open, theme, sidebar collapsed) → React `useState` or Zustand.
+
+**Why both.** Mixing them is the classic React mistake — putting server data in Redux and stale invalidation in your code forever. Query handles "are we fetching", "are we stale", "did this mutation just succeed", and "did another tab change something".
+
+### Route groups vs URL segments
+
+**The Phase 1 fix.** `(auth)` and `(app)` are route groups — wrapped in parens, they don't show up in URLs but let us share a layout (sidebar+topbar for app, two-column auth shell for auth). Real URL structure stays flat: `/`, `/login`, `/signup`, `/dashboard`, `/subscriptions`, `/settings`. We ran into a duplicate `/` route when both `app/page.tsx` and `app/(app)/page.tsx` resolved to `/` — moving the dashboard into `(app)/dashboard/page.tsx` fixed it. **Lesson:** route groups are not paths, only layout wrappers.
+
+### Concepts added to the senior-knowledge map
+
+| Concept                                        | Where in Outflow                     |
+| ---------------------------------------------- | ------------------------------------ |
+| Cookie auth + SameSite + CORS-with-credentials | Auth controller, web fetch helpers   |
+| Refresh token rotation + family burn           | `auth.service.ts → refresh()`        |
+| Constant-time login (timing-oracle defence)    | `auth.service.ts → dummyVerify()`    |
+| Argon2id (memory-hard hashing)                 | Same                                 |
+| Default-deny via APP_GUARD + @Public()         | `app.module.ts` + decorator          |
+| RFC 7807 problem+json                          | `AllExceptionsFilter`                |
+| Prisma soft delete + partial index             | `schema.prisma` + migration SQL      |
+| Money as integer cents + ISO currency          | `Subscription` model + `formatMoney` |
+| Server-only RSC data fetching with cookies     | `lib/server/api.ts`                  |
+| Route groups vs URL segments                   | `apps/web/src/app/(auth)/`, `(app)/` |
