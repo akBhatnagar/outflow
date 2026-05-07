@@ -31,7 +31,11 @@ RUN pnpm --filter @outflow/api deploy --prod /out
 
 # ---------- runtime ----------
 FROM node:${NODE_VERSION}-alpine AS runtime
-RUN apk add --no-cache tini && addgroup -S app && adduser -S app -G app
+# Prisma's musl engine dlopen()s libssl/libcrypto at runtime, so make sure
+# OpenSSL 3 is present even on minimal Alpine images. libc6-compat is a
+# small belt-and-braces package for glibc-style binaries shipped by some
+# Node native modules.
+RUN apk add --no-cache tini openssl libc6-compat && addgroup -S app && adduser -S app -G app
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=builder --chown=app:app /out ./
