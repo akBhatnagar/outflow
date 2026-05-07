@@ -21,6 +21,8 @@ WORKDIR /repo
 COPY --from=deps /repo /repo
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
+ARG NEXT_PUBLIC_APP_URL
+ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 RUN pnpm --filter @outflow/web build
 
 FROM node:${NODE_VERSION}-alpine AS runtime

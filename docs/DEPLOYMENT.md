@@ -184,15 +184,24 @@ If it answers 200 — **you are live.**
 
 In the GitHub repo Settings → Secrets and variables → Actions:
 
-| Name              | Value                                                            |
-| ----------------- | ---------------------------------------------------------------- |
-| `DROPLET_HOST`    | Droplet public IP                                                |
-| `DROPLET_USER`    | `outflow`                                                        |
-| `DROPLET_PORT`    | `22` (omit unless you changed it)                                |
-| `DROPLET_SSH_KEY` | Contents of `~/.ssh/outflow_deploy` (the **private** key)        |
-| `GHCR_PULL_USER`  | Your GitHub username                                             |
-| `GHCR_PULL_TOKEN` | A PAT with `read:packages` (only required if images are private) |
-| `APP_DOMAIN`      | `outflow.akshaybhatnagar.in`                                     |
+| Name              | Value                                                        |
+| ----------------- | ------------------------------------------------------------ |
+| `DROPLET_HOST`    | Droplet public IP (e.g. `206.189.129.16`)                    |
+| `DROPLET_USER`    | SSH user (`root` or your deploy user)                        |
+| `DROPLET_SSH_KEY` | Contents of `~/.ssh/outflow_deploy` (the **private** key)    |
+| `APP_DOMAIN`      | Hostname only, no scheme — e.g. `outflow.akshaybhatnagar.in` |
+
+**No fifth secret is required.** The workflow SSHes on port `22` (hard-coded).
+Images are pulled from GHCR **without** logging in on the droplet when the
+`outflow-api` / `outflow-web` packages are **public**. If you keep them private,
+SSH to the droplet once and run:
+
+```bash
+echo '<PAT-with-read:packages>' | docker login ghcr.io -u <github-username> --password-stdin
+```
+
+That stores credentials in `/root/.docker/config.json` and `docker compose pull`
+works on every deploy without any GitHub secret for GHCR.
 
 Optional: create an environment called `production` so the deploy job is
 gated by it (default policy allows you to require manual approval).
@@ -200,7 +209,8 @@ gated by it (default policy allows you to require manual approval).
 Push a commit to `main`. Watch the workflow run:
 
 - `build-and-push` builds + pushes images to GHCR.
-- `deploy` SSHes to the droplet and runs `infra/scripts/deploy.sh`.
+- `deploy` SSHes to the droplet and runs `infra/scripts/deploy.sh` **or**
+  `infra/scripts/deploy-host-nginx.sh` (auto-detected when host nginx is used).
 - Smoke check curls `https://$APP_DOMAIN/health/ready`.
 
 ---
@@ -318,115 +328,3 @@ but this can still fill if you've rolled back many times.
 - [ ] Cloudflare in front of nginx (DDoS, hides origin IP)
 - [ ] Automated nginx reload on cert renewal (currently manual once per 60–90 d)
 - [ ] Consider DNS-01 challenge for cert issuance to remove port-80 dependency
-
----
-
-## Appendix A — Multi-tenant droplet (host nginx + certbot)
-
-When the droplet already runs other apps behind a host-installed nginx and
-certbot (the common DigitalOcean-portfolio pattern), you do **not** want
-`docker-compose.prod.yml`'s nginx + certbot containers — they'd fight for
-ports 80 and 443. Use `docker-compose.host-nginx.yml` instead:
-
-- The compose stack runs **only** postgres + redis + migrate + api + web.
-- api binds to `127.0.0.1:4001`; web to `127.0.0.1:3002`.
-- Host nginx terminates TLS for `outflow.akshaybhatnagar.in` and reverse-
-  proxies into those local ports.
-- Host certbot issues + renews the cert (no docker certbot sidecar).
-
-### Setup on a host that already has nginx + certbot
-
-```bash
-# 1) Install Docker (the host already has nginx, certbot, ufw — leave them alone)
-apt update
-apt install -y ca-certificates curl gnupg
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-chmod a+r /etc/apt/keyrings/docker.gpg
-UBU=$(. /etc/os-release; echo "${UBUNTU_CODENAME:-${VERSION_CODENAME}}")
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $UBU stable" \
-  > /etc/apt/sources.list.d/docker.list
-apt update
-apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-systemctl enable --now docker
-
-# 2) Clone repo
-mkdir -p /opt && cd /opt
-git clone https://github.com/<owner>/outflow.git
-cd outflow
-
-# 3) Generate .env (one-off)
-RAND() { openssl rand -hex 32; }
-RAND_B64() { openssl rand -base64 32 | tr -d '\n'; }
-cat > .env <<EOF
-GHCR_OWNER=<owner-lowercase>
-IMAGE_TAG=latest
-APP_DOMAIN=outflow.akshaybhatnagar.in
-
-POSTGRES_USER=outflow
-POSTGRES_PASSWORD=$(RAND)
-POSTGRES_DB=outflow
-
-JWT_ACCESS_SECRET=$(RAND)
-JWT_REFRESH_SECRET=$(RAND)
-JWT_ACCESS_TTL=15m
-JWT_REFRESH_TTL=30d
-TOKEN_ENCRYPTION_KEY=base64:$(RAND_B64)
-
-MAIL_DRIVER=log          # or `resend` once you add a key
-MAIL_FROM=Outflow <noreply@outflow.akshaybhatnagar.in>
-RESEND_API_KEY=
-
-HIBP_ENABLED=true
-LOG_LEVEL=info
-EOF
-chmod 600 .env
-
-# 4) Install host nginx site + http-context snippets
-cp infra/nginx-host/outflow-zones.conf /etc/nginx/conf.d/
-cp infra/nginx-host/outflow.akshaybhatnagar.in.conf /etc/nginx/sites-available/outflow
-
-# Issue cert before enabling the HTTPS server block, so nginx can boot the
-# HTTP-only block first to satisfy the ACME challenge.
-mkdir -p /var/www/certbot
-
-# Drop a temporary HTTP-only stub so certbot can solve the challenge:
-cat > /etc/nginx/sites-available/outflow-bootstrap <<'NGINX'
-server {
-    listen 80;
-    listen [::]:80;
-    server_name outflow.akshaybhatnagar.in;
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-    location / {
-        return 404;
-    }
-}
-NGINX
-ln -sf /etc/nginx/sites-available/outflow-bootstrap /etc/nginx/sites-enabled/outflow
-nginx -t && systemctl reload nginx
-
-# 5) Issue the cert (host certbot, webroot)
-certbot certonly --webroot -w /var/www/certbot \
-  -d outflow.akshaybhatnagar.in \
-  --email you@example.com --agree-tos --no-eff-email --rsa-key-size 4096
-
-# 6) Swap in the real site config and reload
-ln -sf /etc/nginx/sites-available/outflow /etc/nginx/sites-enabled/outflow
-nginx -t && systemctl reload nginx
-rm /etc/nginx/sites-available/outflow-bootstrap
-
-# 7) First boot of the stack
-docker compose -f docker-compose.host-nginx.yml --env-file .env pull
-docker compose -f docker-compose.host-nginx.yml --env-file .env up -d
-
-# 8) Verify
-curl -I https://outflow.akshaybhatnagar.in/health/ready
-```
-
-### Future deploys
-
-`bash infra/scripts/deploy-host-nginx.sh <image-tag>`. The CD workflow detects
-the host-nginx layout (presence of `/etc/nginx/sites-enabled/outflow`) and
-calls this script automatically.

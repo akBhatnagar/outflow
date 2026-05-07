@@ -12,6 +12,16 @@ const nextConfig = {
   outputFileTracingRoot: path.join(__dirname, '../../'),
   typedRoutes: true,
   transpilePackages: ['@outflow/ui', '@outflow/contracts'],
+  // In dev the browser calls `/api/v1/...` on the Next origin; we proxy to
+  // Nest on 4000 so we don't need NEXT_PUBLIC_API_URL in .env.local.
+  async rewrites() {
+    if (process.env.NODE_ENV !== 'production') {
+      const target = process.env.API_DEV_PROXY_TARGET ?? 'http://127.0.0.1:4000';
+      const base = target.replace(/\/$/, '');
+      return [{ source: '/api/:path*', destination: `${base}/api/:path*` }];
+    }
+    return [];
+  },
   async headers() {
     return [
       {

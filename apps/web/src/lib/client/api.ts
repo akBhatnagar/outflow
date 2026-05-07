@@ -1,6 +1,27 @@
 // Browser-side fetch wrapper. Always sends cookies (`credentials: 'include'`)
 // so the API can read the httpOnly access token.
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+//
+// When `NEXT_PUBLIC_API_URL` is set at **build** time (e.g. CI or a custom
+// domain split), we call that origin directly. When it is unset — the usual
+// production Docker build — we use same-origin relative URLs (`/api/v1/...`)
+// so the browser hits whatever host served the HTML (nginx proxies `/api/` to
+// Nest). This avoids baking `http://localhost:4000` into the bundle, which
+// breaks HTTPS sites with "Failed to fetch" / mixed-content errors.
+//
+// Local `pnpm dev` relies on `next.config.mjs` rewrites to forward `/api/*`
+// to the API on port 4000.
+function clientApiOrigin(): string {
+  const raw = process.env.NEXT_PUBLIC_API_URL;
+  if (raw && raw.trim().length > 0) return raw.replace(/\/$/, '');
+  return '';
+}
+
+const CLIENT_API_ORIGIN = clientApiOrigin();
+
+function joinClientUrl(path: string): string {
+  if (path.startsWith('http')) return path;
+  return CLIENT_API_ORIGIN ? `${CLIENT_API_ORIGIN}${path}` : path;
+}
 
 interface ApiError extends Error {
   status?: number;
@@ -12,7 +33,7 @@ let refreshInFlight: Promise<void> | null = null;
 async function refreshSession(): Promise<void> {
   if (!refreshInFlight) {
     refreshInFlight = (async () => {
-      const res = await fetch(`${API_BASE}/api/v1/auth/refresh`, {
+      const res = await fetch(joinClientUrl('/api/v1/auth/refresh'), {
         method: 'POST',
         credentials: 'include',
       });
@@ -30,7 +51,7 @@ export async function clientFetch<T>(path: string, init: RequestInit = {}): Prom
     headers.set('Content-Type', 'application/json');
   }
 
-  const url = path.startsWith('http') ? path : `${API_BASE}${path}`;
+  const url = joinClientUrl(path);
   const exec = () => fetch(url, { ...init, headers, credentials: 'include' });
 
   let res = await exec();
@@ -63,6 +84,9 @@ export async function clientFetch<T>(path: string, init: RequestInit = {}): Prom
 }
 
 export function apiErrorMessage(err: unknown, fallback = 'Something went wrong'): string {
+  if (err instanceof TypeError && err.message === 'Failed to fetch') {
+    return 'Could not reach the server. Check your connection and that the API is running.';
+  }
   const e = err as ApiError;
   const body = e?.body as { detail?: string; message?: string } | undefined;
   return body?.detail ?? body?.message ?? e?.message ?? fallback;

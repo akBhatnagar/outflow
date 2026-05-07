@@ -64,6 +64,8 @@ jobs:
           push: true
           cache-from: type=gha,scope=web
           cache-to: type=gha,scope=web,mode=max
+          build-args: |
+            NEXT_PUBLIC_APP_URL=https://${{ secrets.APP_DOMAIN }}
           tags: |
             ghcr.io/${{ steps.meta.outputs.owner_lc }}/outflow-web:${{ steps.meta.outputs.tag }}
             ghcr.io/${{ steps.meta.outputs.owner_lc }}/outflow-web:latest
@@ -82,22 +84,15 @@ jobs:
           host: ${{ secrets.DROPLET_HOST }}
           username: ${{ secrets.DROPLET_USER }}
           key: ${{ secrets.DROPLET_SSH_KEY }}
-          port: ${{ secrets.DROPLET_PORT || '22' }}
+          port: 22
           script: |
             set -euo pipefail
             cd /opt/outflow
             git fetch --quiet
             git reset --hard origin/main
-            # Allow GHCR to pull private images using a deploy-only PAT.
-            # If images are public this just becomes a no-op — login still
-            # succeeds with read-only scopes.
-            if [ -n "${{ secrets.GHCR_PULL_TOKEN }}" ]; then
-              echo "${{ secrets.GHCR_PULL_TOKEN }}" \
-                | docker login ghcr.io -u "${{ secrets.GHCR_PULL_USER }}" --password-stdin
-            fi
-            # Pick the right deploy variant. We check for /etc/nginx/sites-enabled/outflow:
-            #   present  → host nginx is in charge, use host-nginx variant
-            #   absent   → docker nginx + certbot variant
+            # GHCR pulls: if your images are public, no login is needed. If they
+            # are private, run once on the droplet:
+            #   echo '<PAT-with-read:packages>' | docker login ghcr.io -u <github-username> --password-stdin
             if [ -L /etc/nginx/sites-enabled/outflow ] || [ -f /etc/nginx/sites-enabled/outflow ]; then
               IMAGE_TAG=${{ needs.build-and-push.outputs.tag }} bash infra/scripts/deploy-host-nginx.sh
             else

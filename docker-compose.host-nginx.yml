@@ -139,7 +139,7 @@ services:
       NODE_OPTIONS: '--max-old-space-size=320'
       PORT: 3000
       HOSTNAME: 0.0.0.0
-      NEXT_PUBLIC_API_URL: https://${APP_DOMAIN}
+      API_INTERNAL_URL: http://api:4000
       NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
     depends_on:
       api:

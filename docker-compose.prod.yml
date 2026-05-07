@@ -114,6 +114,8 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
+      # RSC / server actions call the API from inside the compose network.
+      API_INTERNAL_URL: http://api:4000
       NEXT_PUBLIC_API_URL: https://${APP_DOMAIN}
       NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
     depends_on:
