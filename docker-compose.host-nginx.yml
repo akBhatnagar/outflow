@@ -1,0 +1,163 @@
+# Outflow — production stack for hosts that already run their own nginx + certbot.
+#
+# Differences vs docker-compose.prod.yml:
+#   - No nginx or certbot services. The host's nginx terminates TLS and reverse
+#     -proxies into the api/web ports below.
+#   - api binds to 127.0.0.1:4001 (host) → 4000 (container)
+#   - web binds to 127.0.0.1:3002 (host) → 3000 (container)
+#   - nothing exposed on 80/443 from the docker side.
+#
+# Use:
+#   IMAGE_TAG=<sha> docker compose -f docker-compose.host-nginx.yml --env-file .env up -d
+#
+# The host nginx site config that pairs with this file lives in
+# `infra/nginx-host/outflow.akshaybhatnagar.in.conf` and gets dropped into
+# `/etc/nginx/sites-available/outflow`.
+
+name: outflow
+
+x-api-image: &api-image ghcr.io/${GHCR_OWNER:?set GHCR_OWNER}/outflow-api:${IMAGE_TAG:-latest}
+x-web-image: &web-image ghcr.io/${GHCR_OWNER:?set GHCR_OWNER}/outflow-web:${IMAGE_TAG:-latest}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    # Tighten Postgres for a small (1 GB) box. These map to ALTER SYSTEM-style
+    # values via `command` so we don't need a custom postgresql.conf mount.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - max_connections=40
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-outflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing}
+      POSTGRES_DB: ${POSTGRES_DB:-outflow}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-outflow} -d ${POSTGRES_DB:-outflow}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [outflow-net]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # On a 1 GB box, force Redis to evict and cap memory rather than getting
+    # OOM-killed by the kernel.
+    command:
+      [
+        'redis-server',
+        '--appendonly',
+        'yes',
+        '--maxmemory',
+        '128mb',
+        '--maxmemory-policy',
+        'allkeys-lru',
+      ]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [outflow-net]
+
+  migrate:
+    image: *api-image
+    restart: 'no'
+    command: ['./node_modules/.bin/prisma', 'migrate', 'deploy']
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-outflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-outflow}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [outflow-net]
+
+  api:
+    image: *api-image
+    restart: unless-stopped
+    # NODE_OPTIONS keeps Node's V8 heap below the box's free RAM under load.
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: '--max-old-space-size=320'
+      API_PORT: 4000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-outflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-outflow}?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?missing}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?missing}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-30d}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?missing}
+      CORS_ORIGINS: https://${APP_DOMAIN}
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+      MAIL_DRIVER: ${MAIL_DRIVER:-log}
+      MAIL_FROM: ${MAIL_FROM:-Outflow <noreply@${APP_DOMAIN}>}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      HIBP_ENABLED: ${HIBP_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - '127.0.0.1:4001:4000'
+    healthcheck:
+      test:
+        ['CMD', 'wget', '--quiet', '--tries=1', '--spider', 'http://127.0.0.1:4000/health/ready']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [outflow-net]
+
+  web:
+    image: *web-image
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: '--max-old-space-size=320'
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_API_URL: https://${APP_DOMAIN}
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:3002:3000'
+    healthcheck:
+      test: ['CMD', 'wget', '--quiet', '--tries=1', '--spider', 'http://127.0.0.1:3000']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [outflow-net]
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  outflow-net:
+    driver: bridge
