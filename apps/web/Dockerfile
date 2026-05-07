@@ -21,7 +21,10 @@ WORKDIR /repo
 COPY --from=deps /repo /repo
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-ARG NEXT_PUBLIC_APP_URL
+# Baked into the client/server bundle for absolute URLs in metadata. Local
+# `docker build` omits this ARG — default keeps `next build` happy. CI passes
+# the real production URL via build-args from `secrets.APP_DOMAIN`.
+ARG NEXT_PUBLIC_APP_URL=http://localhost:3000
 ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 RUN pnpm --filter @outflow/web build
 
