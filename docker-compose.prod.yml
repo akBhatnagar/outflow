@@ -1,0 +1,174 @@
+# Outflow — production stack
+#
+# Brings up the full app on a single Linux box. Designed to run on a
+# DigitalOcean droplet but works on any host with Docker + Compose v2.
+#
+# Boot order:
+#   1. postgres + redis (with healthchecks)
+#   2. migrate (prisma migrate deploy, exits 0)
+#   3. api + web (only after migrate succeeds)
+#   4. nginx (reverse-proxies api + web, terminates TLS)
+#   5. certbot (sidecar; issues + renews Let's Encrypt certs)
+#
+# Variables (from /opt/outflow/.env on the host):
+#   GHCR_OWNER, IMAGE_TAG     — image coordinates pulled from GHCR
+#   POSTGRES_PASSWORD         — non-default db password
+#   JWT_ACCESS_SECRET         — long random string (>=64 hex)
+#   TOKEN_ENCRYPTION_KEY      — 32-byte base64 (used in phase 2 onward)
+#   APP_DOMAIN                — e.g. outflow.akshaybhatnagar.in
+#   ACME_EMAIL                — Let's Encrypt account email
+#   MAIL_DRIVER, RESEND_API_KEY, ...
+
+name: outflow
+
+x-api-image: &api-image ghcr.io/${GHCR_OWNER:?set GHCR_OWNER}/outflow-api:${IMAGE_TAG:-latest}
+x-web-image: &web-image ghcr.io/${GHCR_OWNER:?set GHCR_OWNER}/outflow-web:${IMAGE_TAG:-latest}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-outflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing}
+      POSTGRES_DB: ${POSTGRES_DB:-outflow}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-outflow} -d ${POSTGRES_DB:-outflow}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [outflow-net]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [outflow-net]
+
+  # One-shot job that brings the schema up to date before any app container starts.
+  migrate:
+    image: *api-image
+    restart: 'no'
+    command: ['./node_modules/.bin/prisma', 'migrate', 'deploy']
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-outflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-outflow}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [outflow-net]
+
+  api:
+    image: *api-image
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      API_PORT: 4000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-outflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-outflow}?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?missing}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?missing}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-30d}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?missing}
+      CORS_ORIGINS: https://${APP_DOMAIN}
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+      MAIL_DRIVER: ${MAIL_DRIVER:-resend}
+      MAIL_FROM: ${MAIL_FROM:-Outflow <noreply@${APP_DOMAIN}>}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      HIBP_ENABLED: ${HIBP_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        ['CMD', 'wget', '--quiet', '--tries=1', '--spider', 'http://127.0.0.1:4000/health/ready']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [outflow-net]
+
+  web:
+    image: *web-image
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: https://${APP_DOMAIN}
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '--quiet', '--tries=1', '--spider', 'http://127.0.0.1:3000']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [outflow-net]
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./infra/nginx/snippets:/etc/nginx/snippets:ro
+      - certbot-www:/var/www/certbot:ro
+      - certbot-conf:/etc/letsencrypt:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '--quiet', '--tries=1', '--spider', 'http://127.0.0.1/_health']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    networks: [outflow-net]
+
+  # Certbot performs renewal every 12h; fresh issuance is done out-of-band by
+  # `infra/scripts/init-letsencrypt.sh`. Once renewed, nginx is reloaded by the
+  # cron-style reload sidecar baked into the entrypoint command below.
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    volumes:
+      - certbot-conf:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet --deploy-hook "echo reload-please > /var/www/certbot/.reload"; sleep 12h & wait $${!}; done'
+    networks: [outflow-net]
+
+volumes:
+  postgres-data:
+  redis-data:
+  certbot-www:
+  certbot-conf:
+
+networks:
+  outflow-net:
+    driver: bridge

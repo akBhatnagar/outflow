@@ -1,0 +1,105 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to deploy (defaults to commit SHA)'
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build & push to GHCR
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${GITHUB_SHA::12}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "owner_lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push API
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner_lc }}/outflow-api:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ steps.meta.outputs.owner_lc }}/outflow-api:latest
+
+      - name: Build & push Web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner_lc }}/outflow-web:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ steps.meta.outputs.owner_lc }}/outflow-web:latest
+
+  deploy:
+    name: Deploy to droplet
+    needs: build-and-push
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          port: ${{ secrets.DROPLET_PORT || '22' }}
+          script: |
+            set -euo pipefail
+            cd /opt/outflow
+            git fetch --quiet
+            git reset --hard origin/main
+            # Allow GHCR to pull private images using the runner's token.
+            echo "${{ secrets.GHCR_PULL_TOKEN }}" \
+              | docker login ghcr.io -u "${{ secrets.GHCR_PULL_USER }}" --password-stdin
+            IMAGE_TAG=${{ needs.build-and-push.outputs.tag }} bash infra/scripts/deploy.sh
+
+      - name: Smoke check
+        run: |
+          set -e
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "https://${{ secrets.APP_DOMAIN }}/health/ready" >/dev/null; then
+              echo "ready"; exit 0
+            fi
+            sleep 5
+          done
+          echo "ready check failed"; exit 1

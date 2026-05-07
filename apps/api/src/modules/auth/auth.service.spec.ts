@@ -4,7 +4,22 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 
 import { AuthService } from './auth.service';
+import type { AuthTokenService } from '../../infra/auth-tokens/auth-token.service';
+import type { HibpService } from '../../infra/hibp/hibp.service';
+import type { MailService } from '../../infra/mail/mail.service';
 import type { PrismaService } from '../../infra/prisma/prisma.service';
+
+interface FakeUserRow {
+  id: string;
+  email: string;
+  passwordHash: string;
+  name: string | null;
+  emailVerifiedAt: Date | null;
+  deletedAt: Date | null;
+  failedLoginCount: number;
+  lockedUntil: Date | null;
+  passwordChangedAt: Date;
+}
 
 interface FakeRefreshTokenRow {
   id: string;
@@ -16,28 +31,19 @@ interface FakeRefreshTokenRow {
   expiresAt: Date;
   revokedAt: Date | null;
   replacedBy: string | null;
+  createdAt: Date;
 }
 
 /** Tiny in-memory Prisma double covering only the methods AuthService touches. */
 function makeFakePrisma() {
-  const users = new Map<
-    string,
-    {
-      id: string;
-      email: string;
-      passwordHash: string;
-      name: string | null;
-      emailVerifiedAt: Date | null;
-      deletedAt: Date | null;
-    }
-  >();
+  const users = new Map<string, FakeUserRow>();
   const refreshTokens = new Map<string, FakeRefreshTokenRow>();
   let counter = 0;
   const nextId = () => `id_${++counter}`;
 
   const fake = {
     user: {
-      findUnique: async ({ where, select: _s }: any) => {
+      findUnique: async ({ where }: any) => {
         const found = where.id
           ? users.get(where.id)
           : where.email
@@ -45,17 +51,26 @@ function makeFakePrisma() {
             : null;
         return found ?? null;
       },
-      create: async ({ data, select: _s }: any) => {
+      create: async ({ data }: any) => {
         const id = nextId();
-        const row = {
+        const row: FakeUserRow = {
           id,
           email: data.email,
           passwordHash: data.passwordHash,
           name: data.name ?? null,
           emailVerifiedAt: null,
           deletedAt: null,
+          failedLoginCount: 0,
+          lockedUntil: null,
+          passwordChangedAt: new Date(Date.now() - 1000), // older than any later refresh token
         };
         users.set(id, row);
+        return row;
+      },
+      update: async ({ where, data }: any) => {
+        const row = users.get(where.id);
+        if (!row) throw new Error('user not found');
+        Object.assign(row, data);
         return row;
       },
     },
@@ -72,18 +87,20 @@ function makeFakePrisma() {
           expiresAt: data.expiresAt,
           revokedAt: null,
           replacedBy: null,
+          createdAt: new Date(),
         };
         refreshTokens.set(id, row);
         return row;
       },
-      findUnique: async ({ where, include: _i }: any) => {
+      findUnique: async ({ where }: any) => {
         const row = Array.from(refreshTokens.values()).find((t) => t.tokenHash === where.tokenHash);
         if (!row) return null;
-        return { ...row, user: users.get(row.userId) };
+        const user = users.get(row.userId);
+        return { ...row, user };
       },
       update: async ({ where, data }: any) => {
         const row = refreshTokens.get(where.id);
-        if (!row) throw new Error('not found');
+        if (!row) throw new Error('refresh token not found');
         Object.assign(row, data);
         return row;
       },
@@ -93,6 +110,7 @@ function makeFakePrisma() {
           if (
             (where.familyId ? row.familyId === where.familyId : true) &&
             (where.tokenHash ? row.tokenHash === where.tokenHash : true) &&
+            (where.userId ? row.userId === where.userId : true) &&
             (where.revokedAt === null ? row.revokedAt === null : true)
           ) {
             Object.assign(row, data);
@@ -104,8 +122,25 @@ function makeFakePrisma() {
     },
   };
 
-  return { fake: fake as unknown as PrismaService, _refresh: refreshTokens };
+  return { fake: fake as unknown as PrismaService, _refresh: refreshTokens, _users: users };
 }
+
+const noopAuthTokens: AuthTokenService = {
+  issue: async () => 'fake-token',
+  consume: async () => null,
+  revokeAll: async () => undefined,
+} as unknown as AuthTokenService;
+
+const noopMail: MailService = {
+  sendVerifyEmail: async () => undefined,
+  sendResetPasswordEmail: async () => undefined,
+  send: async () => undefined,
+} as unknown as MailService;
+
+const noopHibp: HibpService = {
+  breachCount: async () => 0,
+  assertNotBreached: async () => undefined,
+} as unknown as HibpService;
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -129,7 +164,7 @@ describe('AuthService', () => {
     } as ConfigService;
 
     const jwt = new JwtService({ secret: 'test-access' });
-    service = new AuthService(prisma.fake, jwt, config);
+    service = new AuthService(prisma.fake, jwt, config, noopAuthTokens, noopMail, noopHibp);
   });
 
   it('signup creates user and issues a token pair', async () => {
@@ -167,10 +202,7 @@ describe('AuthService', () => {
     const { tokens: t2 } = await service.refresh(t1.refreshToken);
     expect(t2.refreshToken).not.toBe(t1.refreshToken);
 
-    // Old token now revoked; reusing it must throw and revoke the family.
     await expect(service.refresh(t1.refreshToken)).rejects.toBeInstanceOf(UnauthorizedException);
-
-    // The newly-rotated token is also revoked because reuse burned the family.
     await expect(service.refresh(t2.refreshToken)).rejects.toBeInstanceOf(UnauthorizedException);
   });
 
@@ -183,5 +215,29 @@ describe('AuthService', () => {
     await expect(service.refresh(tokens.refreshToken)).rejects.toBeInstanceOf(
       UnauthorizedException,
     );
+  });
+
+  it('locks an account after too many failed login attempts', async () => {
+    await service.signup({ email: 'a@b.co', password: 'right-password-1234' });
+    for (let i = 0; i < 10; i++) {
+      await expect(
+        service.login({ email: 'a@b.co', password: 'wrong-password-XYZ7' }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    }
+    // Even the correct password is now refused while the lock is active.
+    await expect(
+      service.login({ email: 'a@b.co', password: 'right-password-1234' }),
+    ).rejects.toMatchObject({ message: expect.stringMatching(/Too many failed attempts/) });
+  });
+
+  it('clears failed-attempt counter on a successful login', async () => {
+    await service.signup({ email: 'a@b.co', password: 'right-password-1234' });
+    await expect(
+      service.login({ email: 'a@b.co', password: 'wrong-password-XYZ7' }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+    await service.login({ email: 'a@b.co', password: 'right-password-1234' });
+    const row = Array.from(prisma._users.values()).find((u) => u.email === 'a@b.co');
+    expect(row?.failedLoginCount).toBe(0);
+    expect(row?.lockedUntil).toBeNull();
   });
 });

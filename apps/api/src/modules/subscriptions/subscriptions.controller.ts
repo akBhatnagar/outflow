@@ -15,6 +15,7 @@ import { SubscriptionStatus } from '@prisma/client';
 
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthUser } from '../../common/types/auth-user';
+import { Audit } from '../audit/audit.decorator';
 
 import { CreateSubscriptionDto } from './dto/create-subscription.dto';
 import { ListSubscriptionsQueryDto } from './dto/list-subscriptions.dto';
@@ -33,6 +34,7 @@ export class SubscriptionsController {
   }
 
   @Post()
+  @Audit({ action: 'subscription.create', resourceType: 'subscription', resourceIdFrom: 'id' })
   create(@CurrentUser() user: AuthUser, @Body() dto: CreateSubscriptionDto) {
     return this.subs.create(user.id, dto);
   }
@@ -43,6 +45,7 @@ export class SubscriptionsController {
   }
 
   @Patch(':id')
+  @Audit({ action: 'subscription.update', resourceType: 'subscription' })
   update(
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
@@ -52,6 +55,7 @@ export class SubscriptionsController {
   }
 
   @Patch(':id/status')
+  @Audit({ action: 'subscription.set_status', resourceType: 'subscription' })
   setStatus(
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
@@ -62,6 +66,7 @@ export class SubscriptionsController {
 
   @Delete(':id')
   @HttpCode(HttpStatus.OK)
+  @Audit({ action: 'subscription.delete', resourceType: 'subscription' })
   remove(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.subs.remove(user.id, id);
   }

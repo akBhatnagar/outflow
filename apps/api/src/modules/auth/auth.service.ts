@@ -1,13 +1,28 @@
-import { ConflictException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { AuthTokenPurpose } from '@prisma/client';
 import * as argon2 from 'argon2';
 import { randomBytes, createHash, randomUUID } from 'node:crypto';
 
+import { AuthTokenService } from '../../infra/auth-tokens/auth-token.service';
+import { HibpService } from '../../infra/hibp/hibp.service';
+import { MailService } from '../../infra/mail/mail.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+
 import type { AccessTokenPayload } from './strategies/jwt.strategy';
 
 const REFRESH_TOKEN_BYTES = 48;
+const VERIFY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const MAX_LOGIN_FAILURES = 10;
+const LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
 
 export interface IssuedTokens {
   accessToken: string;
@@ -39,6 +54,9 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
+    private readonly authTokens: AuthTokenService,
+    private readonly mail: MailService,
+    private readonly hibp: HibpService,
   ) {}
 
   // ---- Public flows ----
@@ -49,6 +67,7 @@ export class AuthService {
       throw new ConflictException('An account with that email already exists');
     }
 
+    await this.assertPasswordSafe(input.password);
     const passwordHash = await argon2.hash(input.password, { type: argon2.argon2id });
 
     const user = await this.prisma.user.create({
@@ -60,6 +79,11 @@ export class AuthService {
       },
       select: { id: true, email: true, name: true, emailVerifiedAt: true },
     });
+
+    // Fire-and-forget; logged but non-blocking on failure so signup still succeeds.
+    void this.dispatchVerifyEmail(user.id, user.email, user.name, input.ip, input.userAgent).catch(
+      (err) => this.logger.warn({ err, userId: user.id }, 'verify-email dispatch failed'),
+    );
 
     const tokens = await this.issueNewTokenFamily(user.id, user.email, input);
     return { user, tokens };
@@ -75,8 +99,17 @@ export class AuthService {
         emailVerifiedAt: true,
         passwordHash: true,
         deletedAt: true,
+        failedLoginCount: true,
+        lockedUntil: true,
       },
     });
+
+    if (user?.lockedUntil && user.lockedUntil > new Date()) {
+      const minutes = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 60_000);
+      throw new UnauthorizedException(
+        `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+      );
+    }
 
     // Always run a hash compare (against a dummy hash if needed) to keep timing constant.
     const ok = user
@@ -84,7 +117,15 @@ export class AuthService {
       : await this.dummyVerify(input.password);
 
     if (!user || user.deletedAt || !ok) {
+      if (user) await this.recordLoginFailure(user.id, user.failedLoginCount);
       throw new UnauthorizedException('Invalid email or password');
+    }
+
+    if (user.failedLoginCount > 0 || user.lockedUntil) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { failedLoginCount: 0, lockedUntil: null },
+      });
     }
 
     const tokens = await this.issueNewTokenFamily(user.id, user.email, input);
@@ -108,7 +149,9 @@ export class AuthService {
     const tokenHash = this.hashRefreshToken(refreshToken);
     const stored = await this.prisma.refreshToken.findUnique({
       where: { tokenHash },
-      include: { user: { select: { id: true, email: true, deletedAt: true } } },
+      include: {
+        user: { select: { id: true, email: true, deletedAt: true, passwordChangedAt: true } },
+      },
     });
 
     if (!stored || !stored.user || stored.user.deletedAt) {
@@ -116,6 +159,14 @@ export class AuthService {
     }
     if (stored.expiresAt < new Date()) {
       throw new UnauthorizedException('Refresh token expired');
+    }
+    if (stored.user.passwordChangedAt > stored.createdAt) {
+      // Password changed after this token was issued — invalidate the whole family.
+      await this.prisma.refreshToken.updateMany({
+        where: { familyId: stored.familyId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      throw new UnauthorizedException('Refresh token invalidated by password change');
     }
     if (stored.revokedAt) {
       // Reuse detected — burn the whole family.
@@ -127,7 +178,6 @@ export class AuthService {
       throw new UnauthorizedException('Refresh token has been revoked');
     }
 
-    // Rotate: revoke current, issue new in same family.
     const tokens = await this.rotateTokenInFamily(
       stored.userId,
       stored.user.email,
@@ -139,9 +189,7 @@ export class AuthService {
     return { tokens };
   }
 
-  /**
-   * Revoke a specific refresh token (and so end the session that owns it).
-   */
+  /** Revoke a specific refresh token (and so end the session that owns it). */
   async logout(refreshToken: string | undefined) {
     if (!refreshToken) return;
     const tokenHash = this.hashRefreshToken(refreshToken);
@@ -151,7 +199,141 @@ export class AuthService {
     });
   }
 
+  // ---- Email verification ----
+
+  async resendVerificationEmail(userId: string, ip?: string, userAgent?: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, name: true, emailVerifiedAt: true, deletedAt: true },
+    });
+    if (!user || user.deletedAt) throw new UnauthorizedException();
+    if (user.emailVerifiedAt) {
+      return { alreadyVerified: true as const };
+    }
+    await this.dispatchVerifyEmail(user.id, user.email, user.name, ip, userAgent);
+    return { alreadyVerified: false as const };
+  }
+
+  async confirmEmailVerification(token: string): Promise<{ ok: true }> {
+    const consumed = await this.authTokens.consume(token, AuthTokenPurpose.EMAIL_VERIFY);
+    if (!consumed) {
+      throw new BadRequestException('Verification link is invalid or has expired');
+    }
+    await this.prisma.user.update({
+      where: { id: consumed.userId },
+      data: { emailVerifiedAt: new Date() },
+    });
+    return { ok: true };
+  }
+
+  // ---- Password reset ----
+
+  async sendForgotPasswordEmail(email: string, ip?: string, userAgent?: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+      select: { id: true, email: true, name: true, deletedAt: true },
+    });
+    // Silent on unknown email — avoids account enumeration.
+    if (!user || user.deletedAt) {
+      this.logger.debug({ email }, 'forgot-password requested for unknown account; ignoring');
+      return;
+    }
+
+    // Invalidate older outstanding reset links — only the latest works.
+    await this.authTokens.revokeAll(user.id, AuthTokenPurpose.PASSWORD_RESET);
+    const cleartext = await this.authTokens.issue({
+      userId: user.id,
+      purpose: AuthTokenPurpose.PASSWORD_RESET,
+      ttlMs: RESET_TOKEN_TTL_MS,
+      ip,
+      userAgent,
+    });
+
+    const base = this.appUrl();
+    const resetUrl = `${base}/reset-password?token=${encodeURIComponent(cleartext)}`;
+    await this.mail.sendResetPasswordEmail({ to: user.email, name: user.name, resetUrl });
+  }
+
+  async resetPassword(token: string, newPassword: string): Promise<void> {
+    await this.assertPasswordSafe(newPassword);
+
+    const consumed = await this.authTokens.consume(token, AuthTokenPurpose.PASSWORD_RESET);
+    if (!consumed) {
+      throw new BadRequestException('Reset link is invalid or has expired');
+    }
+
+    const passwordHash = await argon2.hash(newPassword, { type: argon2.argon2id });
+    const now = new Date();
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: consumed.userId },
+        data: {
+          passwordHash,
+          passwordChangedAt: now,
+          failedLoginCount: 0,
+          lockedUntil: null,
+          // Treat reset as ownership confirmation if not already verified.
+          emailVerifiedAt: now,
+        },
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { userId: consumed.userId, revokedAt: null },
+        data: { revokedAt: now },
+      }),
+      this.prisma.authToken.updateMany({
+        where: {
+          userId: consumed.userId,
+          purpose: AuthTokenPurpose.PASSWORD_RESET,
+          consumedAt: null,
+        },
+        data: { consumedAt: now },
+      }),
+    ]);
+  }
+
   // ---- Internals ----
+
+  private async dispatchVerifyEmail(
+    userId: string,
+    email: string,
+    name: string | null,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<void> {
+    await this.authTokens.revokeAll(userId, AuthTokenPurpose.EMAIL_VERIFY);
+    const cleartext = await this.authTokens.issue({
+      userId,
+      purpose: AuthTokenPurpose.EMAIL_VERIFY,
+      ttlMs: VERIFY_TOKEN_TTL_MS,
+      ip,
+      userAgent,
+    });
+    const base = this.appUrl();
+    const verifyUrl = `${base}/verify-email?token=${encodeURIComponent(cleartext)}`;
+    await this.mail.sendVerifyEmail({ to: email, name, verifyUrl });
+  }
+
+  private async assertPasswordSafe(password: string): Promise<void> {
+    try {
+      await this.hibp.assertNotBreached(password);
+    } catch (err) {
+      const e = err as Error & { code?: string };
+      if (e.code === 'PASSWORD_BREACHED') {
+        throw new BadRequestException(e.message);
+      }
+      throw err;
+    }
+  }
+
+  private async recordLoginFailure(userId: string, currentCount: number): Promise<void> {
+    const next = currentCount + 1;
+    const data: { failedLoginCount: number; lockedUntil?: Date } = { failedLoginCount: next };
+    if (next >= MAX_LOGIN_FAILURES) {
+      data.lockedUntil = new Date(Date.now() + LOCKOUT_MS);
+    }
+    await this.prisma.user.update({ where: { id: userId }, data });
+  }
 
   private async issueNewTokenFamily(
     userId: string,
@@ -174,7 +356,7 @@ export class AuthService {
       where: { id: previousId },
       data: {
         revokedAt: new Date(),
-        replacedBy: tokens.refreshToken.slice(0, 12), // store a non-secret marker for debugging
+        replacedBy: tokens.refreshToken.slice(0, 12),
       },
     });
     return tokens;
@@ -218,7 +400,7 @@ export class AuthService {
 
   /** Constant-time-ish dummy compare to avoid timing oracle on missing users. */
   private async dummyVerify(password: string): Promise<boolean> {
-    const dummy = '$argon2id$v=19$m=65536,t=3,p=4$YQ$YQ'; // intentionally invalid
+    const dummy = '$argon2id$v=19$m=65536,t=3,p=4$YQ$YQ';
     try {
       return await argon2.verify(dummy, password);
     } catch {
@@ -233,5 +415,12 @@ export class AuthService {
     const unit = m[2];
     const mult = unit === 's' ? 1 : unit === 'm' ? 60 : unit === 'h' ? 3600 : 86400;
     return n * mult;
+  }
+
+  private appUrl(): string {
+    return (this.config.get<string>('NEXT_PUBLIC_APP_URL') ?? 'http://localhost:3000').replace(
+      /\/$/,
+      '',
+    );
   }
 }

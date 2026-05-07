@@ -18,24 +18,56 @@ datasource db {
 // ---- Auth & Identity ----
 
 model User {
-  id              String    @id @default(cuid())
-  email           String    @unique @db.Citext
-  passwordHash    String
-  name            String?
-  emailVerifiedAt DateTime?
-  tz              String    @default("UTC")
-  currencyPref    String    @default("USD")
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  deletedAt       DateTime?
+  id                String    @id @default(cuid())
+  email             String    @unique @db.Citext
+  passwordHash      String
+  name              String?
+  emailVerifiedAt   DateTime?
+  tz                String    @default("UTC")
+  currencyPref      String    @default("USD")
+  /// Locks login after too many failures, cleared on success or expiry.
+  failedLoginCount  Int       @default(0)
+  lockedUntil       DateTime?
+  /// Set whenever the password changes — old refresh tokens issued before this
+  /// time are invalidated even if not yet expired.
+  passwordChangedAt DateTime  @default(now())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
 
   refreshTokens  RefreshToken[]
   auditLogs      AuditLog[]
   billingAccount BillingAccount?
   subscriptions  Subscription[]
   charges        Charge[]
+  authTokens     AuthToken[]
 
   @@map("users")
+}
+
+/// Single-use, hashed tokens for email verification and password reset.
+/// We store only sha256(token) — the cleartext token is sent over email and
+/// never persisted. `consumedAt` makes a token strictly single-use.
+model AuthToken {
+  id         String           @id @default(cuid())
+  userId     String
+  purpose    AuthTokenPurpose
+  tokenHash  String           @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime         @default(now())
+  ip         String?
+  userAgent  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@map("auth_tokens")
+}
+
+enum AuthTokenPurpose {
+  EMAIL_VERIFY
+  PASSWORD_RESET
 }
 
 /// Refresh tokens use rotation: every refresh issues a new token and revokes the

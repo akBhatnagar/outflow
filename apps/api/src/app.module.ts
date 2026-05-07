@@ -7,6 +7,7 @@ import { LoggerModule } from 'nestjs-pino';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { HealthModule } from './health/health.module';
 import { PrismaModule } from './infra/prisma/prisma.module';
+import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard';
 import { CategoriesModule } from './modules/categories/categories.module';
@@ -45,6 +46,7 @@ import { SubscriptionsModule } from './modules/subscriptions/subscriptions.modul
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),
     PrismaModule,
     HealthModule,
+    AuditModule,
     AuthModule,
     SubscriptionsModule,
     CategoriesModule,

@@ -15,12 +15,14 @@ import type { Request, Response } from 'express';
 import { Public } from '../../common/decorators/public.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthUser } from '../../common/types/auth-user';
+import { Audit } from '../audit/audit.decorator';
 
 import { AuthService, IssuedTokens } from './auth.service';
 import { ACCESS_COOKIE_NAME } from './strategies/jwt.strategy';
 import { LoginDto } from './dto/login.dto';
 import { SignupDto } from './dto/signup.dto';
 import { AuthResponseDto, AuthUserDto } from './dto/auth-response.dto';
+import { ForgotPasswordDto, ResetPasswordDto, VerifyEmailDto } from './dto/password.dto';
 
 const REFRESH_COOKIE_NAME = 'outflow_rt';
 
@@ -33,6 +35,7 @@ export class AuthController {
   @Post('signup')
   @HttpCode(HttpStatus.CREATED)
   @ApiOkResponse({ type: AuthResponseDto })
+  @Audit({ action: 'user.signup', resourceType: 'user', resourceIdFrom: 'user.id' })
   async signup(
     @Body() body: SignupDto,
     @Req() req: Request,
@@ -53,6 +56,7 @@ export class AuthController {
   @Post('login')
   @HttpCode(HttpStatus.OK)
   @ApiOkResponse({ type: AuthResponseDto })
+  @Audit({ action: 'user.login', resourceType: 'user', resourceIdFrom: 'user.id' })
   async login(
     @Body() body: LoginDto,
     @Req() req: Request,
@@ -89,6 +93,7 @@ export class AuthController {
   @Public()
   @Post('logout')
   @HttpCode(HttpStatus.OK)
+  @Audit({ action: 'user.logout', resourceType: 'user' })
   async logout(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
@@ -103,6 +108,66 @@ export class AuthController {
   @ApiOkResponse({ type: AuthUserDto })
   me(@CurrentUser() user: AuthUser): AuthUserDto {
     return user;
+  }
+
+  // ---- Email verification ----
+
+  @Post('verify-email/send')
+  @HttpCode(HttpStatus.OK)
+  async sendVerifyEmail(
+    @CurrentUser() user: AuthUser,
+    @Req() req: Request,
+  ): Promise<{ ok: true; alreadyVerified: boolean }> {
+    const result = await this.auth.resendVerificationEmail(
+      user.id,
+      this.clientIp(req),
+      req.headers['user-agent'],
+    );
+    return { ok: true, alreadyVerified: result.alreadyVerified };
+  }
+
+  @Public()
+  @Post('verify-email/confirm')
+  @HttpCode(HttpStatus.OK)
+  @Audit({ action: 'user.email_verified', resourceType: 'user' })
+  async confirmVerifyEmail(@Body() body: VerifyEmailDto): Promise<{ ok: true }> {
+    return this.auth.confirmEmailVerification(body.token);
+  }
+
+  // ---- Password reset ----
+
+  /**
+   * Always returns 200 even if the email is unknown. This prevents account
+   * enumeration: an attacker can't tell from the response whether an email
+   * is registered or not.
+   */
+  @Public()
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  async forgotPassword(
+    @Body() body: ForgotPasswordDto,
+    @Req() req: Request,
+  ): Promise<{ ok: true }> {
+    await this.auth.sendForgotPasswordEmail(
+      body.email,
+      this.clientIp(req),
+      req.headers['user-agent'],
+    );
+    return { ok: true };
+  }
+
+  @Public()
+  @Post('reset-password')
+  @HttpCode(HttpStatus.OK)
+  @Audit({ action: 'user.password_reset', resourceType: 'user' })
+  async resetPassword(
+    @Body() body: ResetPasswordDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ ok: true }> {
+    await this.auth.resetPassword(body.token, body.password);
+    // Reset invalidates every session — clear cookies on the requesting browser too.
+    this.clearAuthCookies(res);
+    return { ok: true };
   }
 
   // ---- helpers ----
